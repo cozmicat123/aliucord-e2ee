@@ -45,7 +45,7 @@ class E2eePlugin : Plugin() {
         if (!Crypto.looksEncrypted(content)) return
         val plain = Crypto.decrypt(content, key) ?: return
         try {
-            ReflectUtils.setField(m, "content", SIZE_TAG.matcher(plain).replaceFirst(""))
+            ReflectUtils.setField(m, "content", SIZE_TAG.matcher(plain).replaceFirst("").trimEnd())
         } catch (e: Throwable) {
             logger.error("Failed to set decrypted content", e)
         }
@@ -82,7 +82,7 @@ class E2eePlugin : Plugin() {
                 val key = E2ee.key
                 if (!E2ee.enabled || key == null) return@before
                 val msg = payload.message
-                val plain = msg.content
+                val plain = msg.content?.trim()
                 if (plain.isNullOrBlank() || Crypto.looksEncrypted(plain)) return@before
                 val out = if (plain.length <= Crypto.MAX_PLAINTEXT_LEN) Crypto.encrypt(plain, key) else null
                 ReflectUtils.setField(msg, "content", out ?: "")
