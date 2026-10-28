@@ -31,7 +31,7 @@ class E2eeSettings(private val prefs: SettingsAPI) : SettingsPage() {
         }
 
         val encryptSwitch = Utils.createCheckedSetting(
-            ctx, CheckedSetting.ViewType.SWITCH, "Encrypt outgoing messages", "Text only. Attachments are not encrypted yet.",
+            ctx, CheckedSetting.ViewType.SWITCH, "Encrypt outgoing messages", "Text only. Use /e2eeimage for files.",
         ).apply {
             isChecked = E2ee.enabled
             setOnCheckedListener { on ->

@@ -1,14 +1,21 @@
 package com.e2ee.plugin
 
 import android.content.Context
+import android.view.View
+import android.view.ViewGroup
+import android.widget.LinearLayout
 import com.aliucord.annotations.AliucordPlugin
 import com.aliucord.api.CommandsAPI
 import com.aliucord.entities.Plugin
 import com.aliucord.patcher.*
 import com.aliucord.utils.ReflectUtils
+import com.aliucord.utils.ViewUtils.findViewById
+import com.aliucord.wrappers.messages.AttachmentWrapper.Companion.filename
+import com.aliucord.wrappers.messages.AttachmentWrapper.Companion.url
 import com.discord.restapi.RestAPIParams
 import com.discord.utilities.messagesend.`MessageQueue$doSend$2`
 import com.discord.utilities.rest.SendUtils
+import com.discord.widgets.chat.list.actions.WidgetChatListActions
 import com.discord.widgets.chat.list.adapter.WidgetChatListAdapterItemMessage
 import com.discord.widgets.chat.list.entries.ChatListEntry
 import com.discord.widgets.chat.list.entries.MessageEntry
@@ -64,6 +71,10 @@ class E2eePlugin : Plugin() {
             }
         }
 
+        commands.registerCommand("e2eeimage", "Send attached files encrypted", listOf(CommandsAPI.messageOption)) { ctx ->
+            Images.encryptAttachments(ctx, context) { logger.error("Attachment encryption failed", it) }
+        }
+
         // Incoming: decrypt when the store builds or merges its message model
         patcher.after<ModelMessage>(ApiMessage::class.java) { decrypt(this) }
         patcher.after<ModelMessage>("merge", ApiMessage::class.java) { (param, _: ApiMessage) ->
@@ -73,6 +84,23 @@ class E2eePlugin : Plugin() {
         // Already-cached messages: decrypt when the chat list (re)binds a message
         patcher.before<WidgetChatListAdapterItemMessage>("onConfigure", Int::class.java, ChatListEntry::class.java) { param ->
             (param.args[1] as? MessageEntry)?.message?.let { decrypt(it) }
+        }
+
+        // Long press menu: view an encrypted image attachment
+        patcher.after<WidgetChatListActions>("configureUI", WidgetChatListActions.Model::class.java) { (_, model: WidgetChatListActions.Model) ->
+            val image = model.message.attachments.orEmpty().firstOrNull { Images.isEncryptedImage(it.filename) }
+                ?: return@after
+            val layout = (requireView() as ViewGroup).findViewById<LinearLayout>("dialog_chat_actions_container")
+            if (layout.findViewById<View>(Images.menuViewId) != null) return@after
+            val anchor = layout.findViewById<View?>("dialog_chat_actions_edit") ?: return@after
+
+            val sheet = this
+            val ctx = requireContext()
+            val entry = Images.menuEntry(ctx, "View decrypted image") {
+                sheet.dismiss()
+                Images.showDecrypted(ctx, image.url) { logger.error("Image decrypt failed", it) }
+            }
+            layout.addView(entry, layout.indexOfChild(anchor))
         }
 
         // Outgoing: encrypt right before the request is sent. Fails closed (empty content -> send rejected).
