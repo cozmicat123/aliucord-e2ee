@@ -25,16 +25,22 @@ import com.lytefast.flexinput.R
 import com.lytefast.flexinput.model.Attachment
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileInputStream
 import java.io.IOException
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
+import javax.crypto.Cipher
 import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 
 /**
  * Encrypted file support. The file is `IV(12) || AES-GCM`, the name carries a ".enc" marker
@@ -44,6 +50,13 @@ object Media {
     private const val MAX_IMAGE_BYTES = 50 * 1024 * 1024
     private const val MAX_SIDE = 1600
     private const val CACHE_TTL_MS = 60 * 60 * 1000L
+    private const val DISK_CACHE_BYTES = 150L * 1024 * 1024
+
+    @Volatile private var appContext: Context? = null
+
+    fun init(context: Context) {
+        appContext = context.applicationContext
+    }
 
     private val ENC_MARKER = Pattern.compile("\\.enc(?=\\.|$)", Pattern.CASE_INSENSITIVE)
     private val IMAGE_NAME = Pattern.compile("\\.(?:png|jpe?g|gif|webp|bmp)$", Pattern.CASE_INSENSITIVE)
@@ -105,7 +118,7 @@ object Media {
         pool.execute {
             val startedAt = System.nanoTime()
             val result = try {
-                downloadImage(url, key)
+                downloadImage(url, base, key)
             } catch (e: Throwable) {
                 E2ee.onError(e)
                 null
@@ -230,7 +243,7 @@ object Media {
             var bitmap: Bitmap? = null
             var video: File? = null
             try {
-                if (kind == Kind.IMAGE) bitmap = downloadImage(url, key)?.bitmap else video = downloadVideo(ctx, url, key)
+                if (kind == Kind.IMAGE) bitmap = downloadImage(url, baseUrl(url), key)?.bitmap else video = downloadVideo(ctx, url, key)
             } catch (e: Throwable) {
                 onError(e)
             }
@@ -256,38 +269,100 @@ object Media {
 
     private fun ms(from: Long, to: Long): Long = (to - from) / 1_000_000
 
-    private fun downloadImage(url: String, key: SecretKey): Loaded? {
+    private class Fetched(val bytes: ByteArray, val fromDisk: Boolean)
+
+    private fun readAll(input: InputStream, limit: Int): ByteArray? {
+        val out = ByteArrayOutputStream()
+        val buf = ByteArray(64 * 1024)
+        while (true) {
+            val n = input.read(buf)
+            if (n < 0) break
+            out.write(buf, 0, n)
+            if (out.size() > limit) return null
+        }
+        return out.toByteArray()
+    }
+
+    // The disk cache holds the downloaded ciphertext only, so nothing readable is stored on disk
+    private fun diskFile(base: String): File? {
+        val app = appContext ?: return null
+        val dir = File(app.cacheDir, "e2ee-images").apply { mkdirs() }
+        val hash = MessageDigest.getInstance("SHA-256").digest(base.toByteArray(StandardCharsets.UTF_8))
+        val name = StringBuilder()
+        for (b in hash) name.append(String.format("%02x", b))
+        return File(dir, name.toString())
+    }
+
+    private fun saveAndPrune(file: File, bytes: ByteArray) {
+        try {
+            val tmp = File(file.parentFile, file.name + ".tmp")
+            tmp.outputStream().use { it.write(bytes) }
+            if (!tmp.renameTo(file)) tmp.delete()
+        } catch (ignored: Exception) {
+        }
+        val files = file.parentFile?.listFiles() ?: return
+        var total = 0L
+        for (f in files) total += f.length()
+        if (total <= DISK_CACHE_BYTES) return
+        java.util.Arrays.sort(files) { a, b -> java.lang.Long.compare(a.lastModified(), b.lastModified()) }
+        for (f in files) {
+            if (total <= DISK_CACHE_BYTES) break
+            val size = f.length()
+            if (f.delete()) total -= size
+        }
+    }
+
+    private fun fetchCiphertext(url: String, base: String): Fetched? {
+        val file = diskFile(base)
+        if (file != null && file.exists() && file.length() > 0) {
+            val cached = FileInputStream(file).use { readAll(it, MAX_IMAGE_BYTES + 28) }
+            if (cached != null) {
+                file.setLastModified(System.currentTimeMillis())
+                return Fetched(cached, true)
+            }
+        }
         val conn = open(url) ?: return null
         try {
-            val t0 = System.nanoTime()
             if (conn.responseCode != 200) return null
-            val raw = ByteArrayOutputStream()
-            conn.inputStream.use { input ->
-                val buf = ByteArray(8192)
-                while (true) {
-                    val n = input.read(buf)
-                    if (n < 0) break
-                    raw.write(buf, 0, n)
-                    if (raw.size() > MAX_IMAGE_BYTES + 28) return null
-                }
-            }
-            val t1 = System.nanoTime()
-            val plain = Crypto.decryptBytes(raw.toByteArray(), key) ?: return null
-            val t2 = System.nanoTime()
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(plain, 0, plain.size, bounds)
-            var sample = 1
-            while (bounds.outWidth / sample > MAX_SIDE || bounds.outHeight / sample > MAX_SIDE) sample *= 2
-            val options = BitmapFactory.Options().apply { inSampleSize = sample }
-            val bitmap = BitmapFactory.decodeByteArray(plain, 0, plain.size, options) ?: return null
-            E2ee.log(
-                "image ${raw.size() / 1024}KB ${bounds.outWidth}x${bounds.outHeight} sample=$sample " +
-                    "net=${ms(t0, t1)}ms decrypt=${ms(t1, t2)}ms decode=${ms(t2, System.nanoTime())}ms",
-            )
-            return Loaded(bitmap, bounds.outWidth, bounds.outHeight)
+            val bytes = conn.inputStream.use { readAll(it, MAX_IMAGE_BYTES + 28) } ?: return null
+            if (file != null) saveAndPrune(file, bytes)
+            return Fetched(bytes, false)
         } finally {
             conn.disconnect()
         }
+    }
+
+    // Same bytes as Crypto.decryptBytes (IV(12) || AES-GCM), but one doFinal call instead of a chunked CipherInputStream
+    private fun decryptImage(raw: ByteArray, key: SecretKey): ByteArray? {
+        if (raw.size >= 28) {
+            try {
+                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, raw, 0, 12))
+                return cipher.doFinal(raw, 12, raw.size - 12)
+            } catch (ignored: Exception) {
+            }
+        }
+        return Crypto.decryptBytes(raw, key)
+    }
+
+    private fun downloadImage(url: String, base: String, key: SecretKey): Loaded? {
+        val t0 = System.nanoTime()
+        val fetched = fetchCiphertext(url, base) ?: return null
+        val t1 = System.nanoTime()
+        val plain = decryptImage(fetched.bytes, key) ?: return null
+        val t2 = System.nanoTime()
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(plain, 0, plain.size, bounds)
+        var sample = 1
+        while (bounds.outWidth / sample > MAX_SIDE || bounds.outHeight / sample > MAX_SIDE) sample *= 2
+        val options = BitmapFactory.Options().apply { inSampleSize = sample }
+        val bitmap = BitmapFactory.decodeByteArray(plain, 0, plain.size, options) ?: return null
+        E2ee.log(
+            "image ${fetched.bytes.size / 1024}KB ${bounds.outWidth}x${bounds.outHeight} sample=$sample " +
+                "src=${if (fetched.fromDisk) "disk" else "net"} fetch=${ms(t0, t1)}ms " +
+                "decrypt=${ms(t1, t2)}ms decode=${ms(t2, System.nanoTime())}ms",
+        )
+        return Loaded(bitmap, bounds.outWidth, bounds.outHeight)
     }
 
     private fun downloadVideo(ctx: Context, url: String, key: SecretKey): File? {

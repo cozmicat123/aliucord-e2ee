@@ -93,6 +93,7 @@ class E2eePlugin : Plugin() {
     override fun start(context: Context) {
         E2ee.onError = { logger.error("E2EE error", it) }
         E2ee.log = { logger.info(it) }
+        Media.init(context)
 
         commands.registerCommand("e2ee", "Toggle encryption") {
             when {
