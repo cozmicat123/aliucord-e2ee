@@ -45,6 +45,7 @@ object E2ee {
     @Volatile var canSend = false
     @Volatile var canSendFiles = false
     @Volatile var onError: (Throwable) -> Unit = {}
+    @Volatile var log: (String) -> Unit = {}
 }
 
 @AliucordPlugin(requiresRestart = false)
@@ -91,6 +92,7 @@ class E2eePlugin : Plugin() {
 
     override fun start(context: Context) {
         E2ee.onError = { logger.error("E2EE error", it) }
+        E2ee.log = { logger.info(it) }
 
         commands.registerCommand("e2ee", "Toggle encryption") {
             when {

@@ -101,13 +101,16 @@ object Media {
             }
             waiting[base] = arrayListOf(done)
         }
+        val queuedAt = System.nanoTime()
         pool.execute {
+            val startedAt = System.nanoTime()
             val result = try {
                 downloadImage(url, key)
             } catch (e: Throwable) {
                 E2ee.onError(e)
                 null
             }
+            E2ee.log("inline wait=${ms(queuedAt, startedAt)}ms total=${ms(startedAt, System.nanoTime())}ms ok=${result != null}")
             if (result != null) cache.put(base, result) else failed.add(base)
             val callbacks = synchronized(waiting) { waiting.remove(base) }
             Utils.mainThread.post { callbacks?.forEach { it(result) } }
@@ -251,9 +254,12 @@ object Media {
         return conn
     }
 
+    private fun ms(from: Long, to: Long): Long = (to - from) / 1_000_000
+
     private fun downloadImage(url: String, key: SecretKey): Loaded? {
         val conn = open(url) ?: return null
         try {
+            val t0 = System.nanoTime()
             if (conn.responseCode != 200) return null
             val raw = ByteArrayOutputStream()
             conn.inputStream.use { input ->
@@ -265,13 +271,19 @@ object Media {
                     if (raw.size() > MAX_IMAGE_BYTES + 28) return null
                 }
             }
+            val t1 = System.nanoTime()
             val plain = Crypto.decryptBytes(raw.toByteArray(), key) ?: return null
+            val t2 = System.nanoTime()
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeByteArray(plain, 0, plain.size, bounds)
             var sample = 1
             while (bounds.outWidth / sample > MAX_SIDE || bounds.outHeight / sample > MAX_SIDE) sample *= 2
             val options = BitmapFactory.Options().apply { inSampleSize = sample }
             val bitmap = BitmapFactory.decodeByteArray(plain, 0, plain.size, options) ?: return null
+            E2ee.log(
+                "image ${raw.size() / 1024}KB ${bounds.outWidth}x${bounds.outHeight} sample=$sample " +
+                    "net=${ms(t0, t1)}ms decrypt=${ms(t1, t2)}ms decode=${ms(t2, System.nanoTime())}ms",
+            )
             return Loaded(bitmap, bounds.outWidth, bounds.outHeight)
         } finally {
             conn.disconnect()
