@@ -41,7 +41,6 @@ subprojects {
         author("Anonymous", 0L, hyperlink = false)
 
         // TODO: Change to your repository
-        github("https://github.com/yadavrishabh090-star/aliucord-e2ee")
     }
 
     configure<KtlintExtension> {

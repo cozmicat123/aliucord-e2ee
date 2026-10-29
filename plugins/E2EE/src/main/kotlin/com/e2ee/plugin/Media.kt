@@ -77,6 +77,8 @@ object Media {
     ) {
         override fun sizeOf(key: String, value: Loaded): Int = value.bitmap.byteCount
     }
+    // Files currently being decrypted for viewing, so repeated taps do not open the viewer several times
+    private val opening: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
     private val failed: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
     private val waiting = HashMap<String, MutableList<(Loaded?) -> Unit>>()
 
@@ -238,18 +240,21 @@ object Media {
             Utils.showToast("Set the password in plugin settings first.")
             return
         }
+        val base = baseUrl(url)
+        if (!opening.add(base)) return
         Utils.showToast("Decrypting...")
         Utils.threadPool.execute {
             var bitmap: Bitmap? = null
             var video: File? = null
             try {
-                if (kind == Kind.IMAGE) bitmap = downloadImage(url, baseUrl(url), key)?.bitmap else video = downloadVideo(ctx, url, key)
+                if (kind == Kind.IMAGE) bitmap = downloadImage(url, base, key)?.bitmap else video = downloadVideo(ctx, url, key)
             } catch (e: Throwable) {
                 onError(e)
             }
             val image = bitmap
             val file = video
             Utils.mainThread.post {
+                opening.remove(base)
                 when {
                     image != null -> showBitmap(ctx, image)
                     file != null -> playVideo(ctx, file)
