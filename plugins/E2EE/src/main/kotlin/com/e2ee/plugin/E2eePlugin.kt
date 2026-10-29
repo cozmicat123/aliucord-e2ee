@@ -4,6 +4,7 @@ import android.content.Context
 import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
+import com.aliucord.Utils
 import com.aliucord.annotations.AliucordPlugin
 import com.aliucord.api.CommandsAPI
 import com.aliucord.entities.Plugin
@@ -12,9 +13,14 @@ import com.aliucord.utils.ReflectUtils
 import com.aliucord.utils.ViewUtils.findViewById
 import com.aliucord.wrappers.messages.AttachmentWrapper.Companion.filename
 import com.aliucord.wrappers.messages.AttachmentWrapper.Companion.url
+import com.lytefast.flexinput.model.Attachment
+import de.robv.android.xposed.XC_MethodHook
 import com.discord.restapi.RestAPIParams
 import com.discord.utilities.messagesend.`MessageQueue$doSend$2`
 import com.discord.utilities.rest.SendUtils
+import com.discord.widgets.chat.MessageContent
+import com.discord.widgets.chat.MessageManager
+import com.discord.widgets.chat.input.ChatInputViewModel
 import com.discord.widgets.chat.list.actions.WidgetChatListActions
 import com.discord.widgets.chat.list.adapter.WidgetChatListAdapterItemMessage
 import com.discord.widgets.chat.list.entries.ChatListEntry
@@ -32,6 +38,7 @@ object E2ee {
     @Volatile var key: SecretKey? = null
     @Volatile var enabled = false
     @Volatile var canSend = false
+    @Volatile var canSendFiles = false
 }
 
 @AliucordPlugin(requiresRestart = false)
@@ -58,6 +65,24 @@ class E2eePlugin : Plugin() {
         }
     }
 
+    @Suppress("UNCHECKED_CAST")
+    private fun encryptOutgoingFiles(param: XC_MethodHook.MethodHookParam, context: Context) {
+        val key = E2ee.key
+        if (!E2ee.enabled || key == null) return
+        val files = (param.args[3] as? List<Attachment<*>>).orEmpty()
+        if (files.isEmpty()) return
+        val message = param.args[2] as MessageContent
+        try {
+            val out = Media.encryptForSend(context, key, files, message.textContent.trim())
+            param.args[3] = out.attachments
+            param.args[2] = MessageContent(out.content, message.mentionedUsers)
+        } catch (e: Throwable) {
+            logger.error("File encryption failed", e)
+            Utils.showToast("Encryption failed, nothing was sent.")
+            param.result = null
+        }
+    }
+
     override fun start(context: Context) {
         commands.registerCommand("e2ee", "Toggle encryption") {
             when {
@@ -66,13 +91,9 @@ class E2eePlugin : Plugin() {
                 else -> {
                     E2ee.enabled = !E2ee.enabled
                     settings.setBool(E2ee.ENCRYPT, E2ee.enabled)
-                    CommandsAPI.CommandResult("Encryption ${if (E2ee.enabled) "ON" else "OFF"}", null, false)
+                    CommandsAPI.CommandResult("Encryption ${if (E2ee.enabled) "ON" else "OFF"}${if (E2ee.enabled && !E2ee.canSendFiles) " (files are NOT encrypted)" else ""}", null, false)
                 }
             }
-        }
-
-        commands.registerCommand("e2eeimage", "Send attached files encrypted", listOf(CommandsAPI.messageOption)) { ctx ->
-            Images.encryptAttachments(ctx, context) { logger.error("Attachment encryption failed", it) }
         }
 
         // Incoming: decrypt when the store builds or merges its message model
@@ -86,22 +107,37 @@ class E2eePlugin : Plugin() {
             (param.args[1] as? MessageEntry)?.message?.let { decrypt(it) }
         }
 
-        // Long press menu: view an encrypted image attachment
+        // Long press menu: view an encrypted image or video attachment
         patcher.after<WidgetChatListActions>("configureUI", WidgetChatListActions.Model::class.java) { (_, model: WidgetChatListActions.Model) ->
-            val image = model.message.attachments.orEmpty().firstOrNull { Images.isEncryptedImage(it.filename) }
+            val target = model.message.attachments.orEmpty().firstOrNull { Media.encryptedKind(it.filename) != null }
                 ?: return@after
+            val kind = Media.encryptedKind(target.filename) ?: return@after
             val layout = (requireView() as ViewGroup).findViewById<LinearLayout>("dialog_chat_actions_container")
-            if (layout.findViewById<View>(Images.menuViewId) != null) return@after
+            if (layout.findViewById<View>(Media.menuViewId) != null) return@after
             val anchor = layout.findViewById<View?>("dialog_chat_actions_edit") ?: return@after
 
             val sheet = this
             val ctx = requireContext()
-            val entry = Images.menuEntry(ctx, "View decrypted image") {
+            val label = if (kind == Media.Kind.VIDEO) "View decrypted video" else "View decrypted image"
+            val entry = Media.menuEntry(ctx, label) {
                 sheet.dismiss()
-                Images.showDecrypted(ctx, image.url) { logger.error("Image decrypt failed", it) }
+                Media.showDecrypted(ctx, target.url, kind) { logger.error("Media decrypt failed", it) }
             }
             layout.addView(entry, layout.indexOfChild(anchor))
         }
+
+        // Outgoing files: encrypt files and caption before the message is queued. Fails closed.
+        E2ee.canSendFiles = runCatching {
+            patcher.before<ChatInputViewModel>(
+                "sendMessage",
+                Context::class.java,
+                MessageManager::class.java,
+                MessageContent::class.java,
+                List::class.java,
+                Boolean::class.javaPrimitiveType!!,
+                Function1::class.java,
+            ) { param -> encryptOutgoingFiles(param, context) }
+        }.onFailure { logger.error("sendMessage hook failed, files will not be encrypted", it) }.isSuccess
 
         // Outgoing: encrypt right before the request is sent. Fails closed (empty content -> send rejected).
         E2ee.canSend = runCatching { RestAPIParams.Message::class.java.getDeclaredField("content") }.isSuccess
