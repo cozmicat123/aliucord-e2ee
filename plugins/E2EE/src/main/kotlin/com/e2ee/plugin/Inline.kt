@@ -24,7 +24,7 @@ object Inline {
 
     private val overlayId = View.generateViewId()
     private val cardId by lazy { Utils.getResId("chat_list_item_attachment_card", "id") }
-    private val background = Color.parseColor("#1E1F22")
+    private val overlayColor = Color.parseColor("#1E1F22")
     private val muted = Color.parseColor("#B5BAC1")
 
     fun bind(root: ConstraintLayout, attachment: MessageAttachment, enabled: Boolean) {
@@ -58,7 +58,7 @@ object Inline {
         val overlay = FrameLayout(ctx).apply {
             id = overlayId
             tag = State(base, params.height)
-            setBackgroundColor(background)
+            setBackgroundColor(overlayColor)
             layoutParams = FrameLayout.LayoutParams(-1, -1)
             // A clickable child swallows long presses, so hand them to the message so its menu still opens
             isLongClickable = true
