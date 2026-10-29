@@ -4,6 +4,7 @@ import android.content.Context
 import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
+import androidx.constraintlayout.widget.ConstraintLayout
 import com.aliucord.Utils
 import com.aliucord.annotations.AliucordPlugin
 import com.aliucord.api.CommandsAPI
@@ -15,13 +16,16 @@ import com.aliucord.wrappers.messages.AttachmentWrapper.Companion.filename
 import com.aliucord.wrappers.messages.AttachmentWrapper.Companion.url
 import com.lytefast.flexinput.model.Attachment
 import de.robv.android.xposed.XC_MethodHook
+import com.discord.api.message.attachment.MessageAttachment
 import com.discord.restapi.RestAPIParams
 import com.discord.utilities.messagesend.`MessageQueue$doSend$2`
 import com.discord.utilities.rest.SendUtils
+import com.discord.utilities.textprocessing.MessageRenderContext
 import com.discord.widgets.chat.MessageContent
 import com.discord.widgets.chat.MessageManager
 import com.discord.widgets.chat.input.ChatInputViewModel
 import com.discord.widgets.chat.list.actions.WidgetChatListActions
+import com.discord.widgets.chat.list.adapter.WidgetChatListAdapterItemAttachment
 import com.discord.widgets.chat.list.adapter.WidgetChatListAdapterItemMessage
 import com.discord.widgets.chat.list.entries.ChatListEntry
 import com.discord.widgets.chat.list.entries.MessageEntry
@@ -34,11 +38,13 @@ object E2ee {
     const val REMEMBER = "remember"
     const val PASSWORD = "password"
     const val ENCRYPT = "encrypt"
+    const val INLINE = "inline"
 
     @Volatile var key: SecretKey? = null
     @Volatile var enabled = false
     @Volatile var canSend = false
     @Volatile var canSendFiles = false
+    @Volatile var onError: (Throwable) -> Unit = {}
 }
 
 @AliucordPlugin(requiresRestart = false)
@@ -84,6 +90,8 @@ class E2eePlugin : Plugin() {
     }
 
     override fun start(context: Context) {
+        E2ee.onError = { logger.error("E2EE error", it) }
+
         commands.registerCommand("e2ee", "Toggle encryption") {
             when {
                 E2ee.key == null -> CommandsAPI.CommandResult("Set the password in plugin settings first.", null, false)
@@ -124,6 +132,20 @@ class E2eePlugin : Plugin() {
                 Media.showDecrypted(ctx, target.url, kind) { logger.error("Media decrypt failed", it) }
             }
             layout.addView(entry, layout.indexOfChild(anchor))
+        }
+
+        // Inline view: show encrypted images where the generic file card would be
+        patcher.after<WidgetChatListAdapterItemAttachment>(
+            "configureFileData",
+            MessageAttachment::class.java,
+            MessageRenderContext::class.java,
+        ) { param ->
+            try {
+                val root = WidgetChatListAdapterItemAttachment.`access$getBinding$p`(this).root as ConstraintLayout
+                Inline.bind(root, param.args[0] as MessageAttachment, settings.getBool(E2ee.INLINE, true))
+            } catch (e: Throwable) {
+                logger.error("Inline media failed", e)
+            }
         }
 
         // Outgoing files: encrypt files and caption before the message is queued. Fails closed.
@@ -171,5 +193,6 @@ class E2eePlugin : Plugin() {
         patcher.unpatchAll()
         E2ee.key = null
         E2ee.enabled = false
+        Media.onKeyChanged()
     }
 }

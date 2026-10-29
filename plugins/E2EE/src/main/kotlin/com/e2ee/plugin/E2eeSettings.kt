@@ -56,6 +56,14 @@ class E2eeSettings(private val prefs: SettingsAPI) : SettingsPage() {
             }
         }
 
+        val inlineSwitch = Utils.createCheckedSetting(
+            ctx, CheckedSetting.ViewType.SWITCH, "Show encrypted images inline",
+            "Decrypts images in the chat. Videos play when tapped. Turn off if chat feels slow.",
+        ).apply {
+            isChecked = prefs.getBool(E2ee.INLINE, true)
+            setOnCheckedListener { on -> prefs.setBool(E2ee.INLINE, on) }
+        }
+
         val setBtn = Button(ctx).apply {
             text = "Set key"
             layoutParams = margins()
@@ -70,6 +78,7 @@ class E2eeSettings(private val prefs: SettingsAPI) : SettingsPage() {
                             toast("Key derivation failed")
                         } else {
                             E2ee.key = k
+                            Media.onKeyChanged()
                             prefs.setString(E2ee.PASSWORD, if (rememberSwitch.isChecked) pw else "")
                             input.editText.setText("")
                             toast("Key set")
@@ -85,6 +94,7 @@ class E2eeSettings(private val prefs: SettingsAPI) : SettingsPage() {
             setOnClickListener {
                 E2ee.key = null
                 E2ee.enabled = false
+                Media.onKeyChanged()
                 prefs.setString(E2ee.PASSWORD, "")
                 prefs.setBool(E2ee.ENCRYPT, false)
                 encryptSwitch.isChecked = false
@@ -98,6 +108,7 @@ class E2eeSettings(private val prefs: SettingsAPI) : SettingsPage() {
             addView(clearBtn)
             addView(encryptSwitch)
             addView(rememberSwitch)
+            addView(inlineSwitch)
         }
     }
 }

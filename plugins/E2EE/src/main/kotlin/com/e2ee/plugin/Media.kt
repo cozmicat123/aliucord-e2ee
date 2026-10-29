@@ -7,6 +7,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.util.LruCache
 import android.view.Gravity
 import android.view.View
 import android.widget.FrameLayout
@@ -27,6 +28,11 @@ import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
 import javax.crypto.SecretKey
 
@@ -36,7 +42,7 @@ import javax.crypto.SecretKey
  */
 object Media {
     private const val MAX_IMAGE_BYTES = 50 * 1024 * 1024
-    private const val MAX_SIDE = 2048
+    private const val MAX_SIDE = 1600
     private const val CACHE_TTL_MS = 60 * 60 * 1000L
 
     private val ENC_MARKER = Pattern.compile("\\.enc(?=\\.|$)", Pattern.CASE_INSENSITIVE)
@@ -48,6 +54,65 @@ object Media {
     enum class Kind { IMAGE, VIDEO }
 
     class Outgoing(val attachments: List<Attachment<*>>, val content: String)
+
+    /** A decoded (possibly downscaled) image plus the size of the original. */
+    class Loaded(val bitmap: Bitmap, val width: Int, val height: Int)
+
+    // Decoded images, bounded by a fraction of the app heap. Memory only, nothing decrypted touches disk.
+    private val cache = object : LruCache<String, Loaded>(
+        Math.max(4 * 1024 * 1024, (Runtime.getRuntime().maxMemory() / 16).toInt()),
+    ) {
+        override fun sizeOf(key: String, value: Loaded): Int = value.bitmap.byteCount
+    }
+    private val failed: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+    private val waiting = HashMap<String, MutableList<(Loaded?) -> Unit>>()
+
+    // Two workers at most, idle threads time out so nothing is held while the chat is quiet.
+    private val pool = ThreadPoolExecutor(2, 2, 30L, TimeUnit.SECONDS, LinkedBlockingQueue<Runnable>())
+        .apply { allowCoreThreadTimeOut(true) }
+
+    fun baseUrl(url: String): String {
+        val query = url.indexOf('?')
+        return if (query > 0) url.substring(0, query) else url
+    }
+
+    fun cached(base: String): Loaded? = cache.get(base)
+
+    fun hasFailed(base: String): Boolean = failed.contains(base)
+
+    /** Call whenever the key changes, so images are decrypted again with the new key. */
+    fun onKeyChanged() {
+        cache.evictAll()
+        failed.clear()
+    }
+
+    /** Downloads and decrypts an image off the main thread. [done] runs on the main thread. */
+    fun loadInline(url: String, base: String, done: (Loaded?) -> Unit) {
+        val key = E2ee.key
+        if (key == null) {
+            done(null)
+            return
+        }
+        synchronized(waiting) {
+            val list = waiting[base]
+            if (list != null) {
+                list.add(done)
+                return
+            }
+            waiting[base] = arrayListOf(done)
+        }
+        pool.execute {
+            val result = try {
+                downloadImage(url, key)
+            } catch (e: Throwable) {
+                E2ee.onError(e)
+                null
+            }
+            if (result != null) cache.put(base, result) else failed.add(base)
+            val callbacks = synchronized(waiting) { waiting.remove(base) }
+            Utils.mainThread.post { callbacks?.forEach { it(result) } }
+        }
+    }
 
     fun encryptedKind(filename: String?): Kind? {
         if (filename == null || !ENC_MARKER.matcher(filename).find()) return null
@@ -162,7 +227,7 @@ object Media {
             var bitmap: Bitmap? = null
             var video: File? = null
             try {
-                if (kind == Kind.IMAGE) bitmap = downloadImage(url, key) else video = downloadVideo(ctx, url, key)
+                if (kind == Kind.IMAGE) bitmap = downloadImage(url, key)?.bitmap else video = downloadVideo(ctx, url, key)
             } catch (e: Throwable) {
                 onError(e)
             }
@@ -170,7 +235,7 @@ object Media {
             val file = video
             Utils.mainThread.post {
                 when {
-                    image != null -> showImage(ctx, image)
+                    image != null -> showBitmap(ctx, image)
                     file != null -> playVideo(ctx, file)
                     else -> Utils.showToast("Could not decrypt this file.")
                 }
@@ -186,7 +251,7 @@ object Media {
         return conn
     }
 
-    private fun downloadImage(url: String, key: SecretKey): Bitmap? {
+    private fun downloadImage(url: String, key: SecretKey): Loaded? {
         val conn = open(url) ?: return null
         try {
             if (conn.responseCode != 200) return null
@@ -206,15 +271,15 @@ object Media {
             var sample = 1
             while (bounds.outWidth / sample > MAX_SIDE || bounds.outHeight / sample > MAX_SIDE) sample *= 2
             val options = BitmapFactory.Options().apply { inSampleSize = sample }
-            return BitmapFactory.decodeByteArray(plain, 0, plain.size, options)
+            val bitmap = BitmapFactory.decodeByteArray(plain, 0, plain.size, options) ?: return null
+            return Loaded(bitmap, bounds.outWidth, bounds.outHeight)
         } finally {
             conn.disconnect()
         }
     }
 
     private fun downloadVideo(ctx: Context, url: String, key: SecretKey): File? {
-        val query = url.indexOf('?')
-        val base = if (query > 0) url.substring(0, query) else url
+        val base = baseUrl(url)
         val file = File(cacheDir(ctx), Math.abs(base.hashCode()).toString() + ".mp4")
         if (file.exists() && file.length() > 0) return file
 
@@ -234,7 +299,7 @@ object Media {
         }
     }
 
-    private fun showImage(ctx: Context, bitmap: Bitmap) {
+    fun showBitmap(ctx: Context, bitmap: Bitmap) {
         val image = ImageView(ctx).apply {
             setImageBitmap(bitmap)
             scaleType = ImageView.ScaleType.FIT_CENTER
