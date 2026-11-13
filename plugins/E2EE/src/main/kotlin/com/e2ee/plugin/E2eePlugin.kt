@@ -16,6 +16,7 @@ import com.aliucord.wrappers.messages.AttachmentWrapper.Companion.filename
 import com.aliucord.wrappers.messages.AttachmentWrapper.Companion.url
 import com.lytefast.flexinput.model.Attachment
 import de.robv.android.xposed.XC_MethodHook
+import com.discord.api.user.User
 import com.discord.restapi.RestAPIParams
 import com.discord.stores.StoreStream
 import com.discord.utilities.rest.RestAPI
@@ -120,8 +121,11 @@ class E2eePlugin : Plugin() {
     private fun decryptReply(ref: ApiMessage, key: SecretKey, channelId: Long) {
         val content = runCatching { ReflectUtils.getField(ref, "content") as? String }.getOrNull() ?: return
         if (!Crypto.looksEncrypted(content)) return
-        val replyChannel = if (ref.channelId != 0L) ref.channelId else channelId
-        val plain = Crypto.decrypt(content, key, replyChannel.toString(), ref.author?.id?.toString()) ?: return
+        // The API Message getters are obfuscated, but its fields keep their names
+        val refChannel = runCatching { ReflectUtils.getField(ref, "channelId") as? Long }.getOrNull() ?: 0L
+        val refAuthor = runCatching { ReflectUtils.getField(ref, "author") as? User }.getOrNull()
+        val replyChannel = if (refChannel != 0L) refChannel else channelId
+        val plain = Crypto.decrypt(content, key, replyChannel.toString(), refAuthor?.id?.toString()) ?: return
         setContent(ref, Media.stripSizeTag(plain))
     }
 

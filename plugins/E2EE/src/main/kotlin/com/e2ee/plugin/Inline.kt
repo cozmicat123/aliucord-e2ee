@@ -166,7 +166,7 @@ object Inline {
                     approved.add(base)
                     start(true)
                 }
-                else -> Unit
+                else -> {}
             }
         }
         start(approved.contains(base))
