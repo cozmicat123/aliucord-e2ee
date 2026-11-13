@@ -45,17 +45,6 @@ class E2eeSettings(private val prefs: SettingsAPI) : SettingsPage() {
             }
         }
 
-        val rememberSwitch = Utils.createCheckedSetting(
-            ctx, CheckedSetting.ViewType.SWITCH, "Remember password",
-            "Saved in plain text on this device and loaded at startup. Off = asked every session. Takes effect when you press Set key.",
-        ).apply {
-            isChecked = prefs.getBool(E2ee.REMEMBER, false)
-            setOnCheckedListener { on ->
-                prefs.setBool(E2ee.REMEMBER, on)
-                if (!on) prefs.setString(E2ee.PASSWORD, "")
-            }
-        }
-
         val inlineSwitch = Utils.createCheckedSetting(
             ctx, CheckedSetting.ViewType.SWITCH, "Show encrypted images inline",
             "Decrypts images in the chat. Videos play when tapped. Turn off if chat feels slow.",
@@ -69,8 +58,9 @@ class E2eeSettings(private val prefs: SettingsAPI) : SettingsPage() {
             layoutParams = margins()
             setOnClickListener {
                 val pw = input.editText.text.toString()
-                if (pw.isEmpty() || pw.length > 128) return@setOnClickListener toast("Password must be 1-128 chars")
-                toast("Deriving key...")
+                if (pw.length < 8) return@setOnClickListener toast("Use at least 8 characters")
+                if (pw.length > 256) return@setOnClickListener toast("Password too long (max 256)")
+                toast("Deriving key, this takes a few seconds\u2026")
                 Thread {
                     val k = Crypto.deriveKey(pw)
                     view.post {
@@ -79,7 +69,6 @@ class E2eeSettings(private val prefs: SettingsAPI) : SettingsPage() {
                         } else {
                             E2ee.key = k
                             Media.onKeyChanged()
-                            prefs.setString(E2ee.PASSWORD, if (rememberSwitch.isChecked) pw else "")
                             input.editText.setText("")
                             toast("Key set")
                         }
@@ -95,7 +84,6 @@ class E2eeSettings(private val prefs: SettingsAPI) : SettingsPage() {
                 E2ee.key = null
                 E2ee.enabled = false
                 Media.onKeyChanged()
-                prefs.setString(E2ee.PASSWORD, "")
                 prefs.setBool(E2ee.ENCRYPT, false)
                 encryptSwitch.isChecked = false
                 toast("Key cleared")
@@ -107,7 +95,6 @@ class E2eeSettings(private val prefs: SettingsAPI) : SettingsPage() {
             addView(setBtn)
             addView(clearBtn)
             addView(encryptSwitch)
-            addView(rememberSwitch)
             addView(inlineSwitch)
         }
     }

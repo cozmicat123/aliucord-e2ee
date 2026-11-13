@@ -18,8 +18,8 @@ import com.lytefast.flexinput.model.Attachment
 import de.robv.android.xposed.XC_MethodHook
 import com.discord.api.message.attachment.MessageAttachment
 import com.discord.restapi.RestAPIParams
-import com.discord.utilities.messagesend.`MessageQueue$doSend$2`
-import com.discord.utilities.rest.SendUtils
+import com.discord.stores.StoreStream
+import com.discord.utilities.rest.RestAPI
 import com.discord.utilities.textprocessing.MessageRenderContext
 import com.discord.widgets.chat.MessageContent
 import com.discord.widgets.chat.MessageManager
@@ -29,23 +29,67 @@ import com.discord.widgets.chat.list.adapter.WidgetChatListAdapterItemAttachment
 import com.discord.widgets.chat.list.adapter.WidgetChatListAdapterItemMessage
 import com.discord.widgets.chat.list.entries.ChatListEntry
 import com.discord.widgets.chat.list.entries.MessageEntry
+import java.util.concurrent.ConcurrentHashMap
 import java.util.regex.Pattern
 import javax.crypto.SecretKey
 import com.discord.api.message.Message as ApiMessage
 import com.discord.models.message.Message as ModelMessage
 
 object E2ee {
-    const val REMEMBER = "remember"
-    const val PASSWORD = "password"
     const val ENCRYPT = "encrypt"
     const val INLINE = "inline"
+    const val PRESET = "preset"
 
     @Volatile var key: SecretKey? = null
     @Volatile var enabled = false
+    @Volatile var preset: Crypto.Preset = Crypto.Preset.AES256
     @Volatile var canSend = false
     @Volatile var canSendFiles = false
     @Volatile var onError: (Throwable) -> Unit = {}
     @Volatile var log: (String) -> Unit = {}
+
+    // Forced-channel keys are derived once per channel; never start two 64 MiB derivations for one channel
+    private val preparing = ConcurrentHashMap.newKeySet<String>()
+
+    fun isForced(channelId: Long) = ForcedKeys.isForced(channelId.toString())
+
+    // Same rules as Aegires MessageListScreen.key(), preset() and encOn()
+    fun keyFor(channelId: Long): SecretKey? {
+        val id = channelId.toString()
+        if (!ForcedKeys.isForced(id)) return key
+        ForcedKeys.keyFor(id)?.let { return it }
+        if (preparing.add(id)) ForcedKeys.prepare(id) { preparing.remove(id) }
+        return null
+    }
+
+    fun presetFor(channelId: Long): Crypto.Preset = if (isForced(channelId)) Crypto.Preset.AES128 else preset
+
+    fun encryptOn(channelId: Long): Boolean = isForced(channelId) || enabled
+
+    fun selfId(): String? = StoreStream.getUsers().me?.id?.toString()
+
+    // Same checks and messages as Aegires MessageCryptoHelper.prepareOutgoingText. Null = do not send.
+    fun encryptText(channelId: Long, plain: String): String? {
+        val key = keyFor(channelId)
+        if (key == null) {
+            Utils.showToast(if (isForced(channelId)) "Encryption key not ready yet" else "Encryption key missing")
+            return null
+        }
+        val sender = selfId()
+        if (sender == null) {
+            Utils.showToast("Not ready yet, try again in a moment")
+            return null
+        }
+        val p = presetFor(channelId)
+        val max = Crypto.maxPlaintextBytes(p)
+        if (Crypto.utf8Length(plain) > max) {
+            Utils.showToast("Too long for ${p.label} (max $max bytes)")
+            return null
+        }
+        val out = Crypto.encrypt(plain, key, p, channelId.toString(), sender)
+        if (out == null) Utils.showToast("Encryption failed")
+        return out
+    }
 }
 
 @AliucordPlugin(requiresRestart = false)
@@ -60,16 +104,40 @@ class E2eePlugin : Plugin() {
         settingsTab = Plugin.SettingsTab(E2eeSettings::class.java).withArgs(settings)
     }
 
-    private fun decrypt(m: ModelMessage) {
-        val key = E2ee.key ?: return
-        val content = m.content ?: return
-        if (!Crypto.looksEncrypted(content)) return
-        val plain = Crypto.decrypt(content, key) ?: return
+    private fun setContent(target: Any, text: String) {
         try {
-            ReflectUtils.setField(m, "content", SIZE_TAG.matcher(plain).replaceFirst("").trimEnd())
+            ReflectUtils.setField(target, "content", text)
         } catch (e: Throwable) {
             logger.error("Failed to set decrypted content", e)
         }
+    }
+
+    private fun decrypt(m: ModelMessage) {
+        val channelId = m.channelId
+        val key = E2ee.keyFor(channelId) ?: return
+        val content = m.content
+        if (content != null && Crypto.looksEncrypted(content)) {
+            val plain = Crypto.decrypt(content, key, channelId.toString(), m.author?.id?.toString())
+            if (plain != null) setContent(m, SIZE_TAG.matcher(plain).replaceFirst("").trimEnd())
+        }
+        m.referencedMessage?.let { decryptReply(it, key, channelId) }
+    }
+
+    // Reply preview, same as Aegires MessageCryptoHelper: the replied-to message carries its own channel and author
+    private fun decryptReply(ref: ApiMessage, key: SecretKey, channelId: Long) {
+        val content = runCatching { ReflectUtils.getField(ref, "content") as? String }.getOrNull() ?: return
+        if (!Crypto.looksEncrypted(content)) return
+        val replyChannel = if (ref.channelId != 0L) ref.channelId else channelId
+        val plain = Crypto.decrypt(content, key, replyChannel.toString(), ref.author?.id?.toString()) ?: return
+        setContent(ref, SIZE_TAG.matcher(plain).replaceFirst("").trimEnd())
+    }
+
+    private fun encryptOutgoing(channelId: Long, msg: RestAPIParams.Message) {
+        if (!E2ee.encryptOn(channelId)) return
+        val plain = msg.content?.trim()
+        if (plain.isNullOrBlank() || Crypto.looksEncrypted(plain)) return
+        // Fails closed: an empty content is rejected by Discord, so nothing readable is ever sent
+        ReflectUtils.setField(msg, "content", E2ee.encryptText(channelId, plain) ?: "")
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -94,6 +162,7 @@ class E2eePlugin : Plugin() {
         E2ee.onError = { logger.error("E2EE error", it) }
         E2ee.log = { logger.info(it) }
         Media.init(context)
+        E2ee.preset = Crypto.Preset.fromIndex(settings.getInt(E2ee.PRESET, Crypto.Preset.AES256.index)) ?: Crypto.Preset.AES256
 
         commands.registerCommand("e2ee", "Toggle encryption") {
             when {
@@ -164,32 +233,21 @@ class E2eePlugin : Plugin() {
             ) { param -> encryptOutgoingFiles(param, context) }
         }.onFailure { logger.error("sendMessage hook failed, files will not be encrypted", it) }.isSuccess
 
-        // Outgoing: encrypt right before the request is sent. Fails closed (empty content -> send rejected).
-        E2ee.canSend = runCatching { RestAPIParams.Message::class.java.getDeclaredField("content") }.isSuccess
-        if (E2ee.canSend) {
-            patcher.before<`MessageQueue$doSend$2`<*, *>>("call", SendUtils.SendPayload.ReadyToSend::class.java) { (_, payload: SendUtils.SendPayload.ReadyToSend) ->
-                val key = E2ee.key
-                if (!E2ee.enabled || key == null) return@before
-                val msg = payload.message
-                val plain = msg.content?.trim()
-                if (plain.isNullOrBlank() || Crypto.looksEncrypted(plain)) return@before
-                val out = if (plain.length <= Crypto.MAX_PLAINTEXT_LEN) Crypto.encrypt(plain, key) else null
-                ReflectUtils.setField(msg, "content", out ?: "")
-            }
-        } else {
-            logger.error("RestAPIParams.Message.content not found, outgoing encryption disabled", null)
-        }
-
-        // Restore the remembered key off the main thread (PBKDF2 is slow)
-        if (settings.getBool(E2ee.REMEMBER, false)) {
-            val saved = settings.getString(E2ee.PASSWORD, "")
-            if (saved.isNotEmpty()) {
-                Thread {
-                    E2ee.key = Crypto.deriveKey(saved)
-                    E2ee.enabled = E2ee.key != null && E2ee.canSend && settings.getBool(E2ee.ENCRYPT, false)
-                }.start()
-            }
-        }
+        // Outgoing text and edits: same RestAPI hooks as mantikafasi/EncryptDMs (channel id is args[0]). Fails closed.
+        E2ee.canSend = runCatching {
+            RestAPIParams.Message::class.java.getDeclaredField("content")
+            patcher.before<RestAPI>(
+                "sendMessage",
+                Long::class.javaPrimitiveType!!,
+                RestAPIParams.Message::class.java,
+            ) { param -> encryptOutgoing(param.args[0] as Long, param.args[1] as RestAPIParams.Message) }
+            patcher.before<RestAPI>(
+                "editMessage",
+                Long::class.javaPrimitiveType!!,
+                Long::class.javaPrimitiveType!!,
+                RestAPIParams.Message::class.java,
+            ) { param -> encryptOutgoing(param.args[0] as Long, param.args[2] as RestAPIParams.Message) }
+        }.onFailure { logger.error("RestAPI send hooks failed, outgoing encryption disabled", it) }.isSuccess
     }
 
     override fun stop(context: Context) {
