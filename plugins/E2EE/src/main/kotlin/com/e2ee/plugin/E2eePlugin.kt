@@ -16,21 +16,19 @@ import com.aliucord.wrappers.messages.AttachmentWrapper.Companion.filename
 import com.aliucord.wrappers.messages.AttachmentWrapper.Companion.url
 import com.lytefast.flexinput.model.Attachment
 import de.robv.android.xposed.XC_MethodHook
-import com.discord.api.message.attachment.MessageAttachment
 import com.discord.restapi.RestAPIParams
 import com.discord.stores.StoreStream
 import com.discord.utilities.rest.RestAPI
-import com.discord.utilities.textprocessing.MessageRenderContext
 import com.discord.widgets.chat.MessageContent
 import com.discord.widgets.chat.MessageManager
 import com.discord.widgets.chat.input.ChatInputViewModel
 import com.discord.widgets.chat.list.actions.WidgetChatListActions
 import com.discord.widgets.chat.list.adapter.WidgetChatListAdapterItemAttachment
 import com.discord.widgets.chat.list.adapter.WidgetChatListAdapterItemMessage
+import com.discord.widgets.chat.list.entries.AttachmentEntry
 import com.discord.widgets.chat.list.entries.ChatListEntry
 import com.discord.widgets.chat.list.entries.MessageEntry
 import java.util.concurrent.ConcurrentHashMap
-import java.util.regex.Pattern
 import javax.crypto.SecretKey
 import com.discord.api.message.Message as ApiMessage
 import com.discord.models.message.Message as ModelMessage
@@ -95,11 +93,6 @@ object E2ee {
 @AliucordPlugin(requiresRestart = false)
 @Suppress("unused")
 class E2eePlugin : Plugin() {
-    private companion object {
-        // Image messages carry a hidden "[sz:W,H]" prefix inside the encrypted text
-        val SIZE_TAG: Pattern = Pattern.compile("^\\[sz:\\d+,\\d+]")
-    }
-
     init {
         settingsTab = Plugin.SettingsTab(E2eeSettings::class.java).withArgs(settings)
     }
@@ -118,7 +111,7 @@ class E2eePlugin : Plugin() {
         val content = m.content
         if (content != null && Crypto.looksEncrypted(content)) {
             val plain = Crypto.decrypt(content, key, channelId.toString(), m.author?.id?.toString())
-            if (plain != null) setContent(m, SIZE_TAG.matcher(plain).replaceFirst("").trimEnd())
+            if (plain != null) setContent(m, Media.stripSizeTag(plain, m.id))
         }
         m.referencedMessage?.let { decryptReply(it, key, channelId) }
     }
@@ -129,7 +122,7 @@ class E2eePlugin : Plugin() {
         if (!Crypto.looksEncrypted(content)) return
         val replyChannel = if (ref.channelId != 0L) ref.channelId else channelId
         val plain = Crypto.decrypt(content, key, replyChannel.toString(), ref.author?.id?.toString()) ?: return
-        setContent(ref, SIZE_TAG.matcher(plain).replaceFirst("").trimEnd())
+        setContent(ref, Media.stripSizeTag(plain))
     }
 
     private fun encryptOutgoing(channelId: Long, msg: RestAPIParams.Message) {
@@ -142,13 +135,18 @@ class E2eePlugin : Plugin() {
 
     @Suppress("UNCHECKED_CAST")
     private fun encryptOutgoingFiles(param: XC_MethodHook.MethodHookParam, context: Context) {
-        val key = E2ee.key
-        if (!E2ee.enabled || key == null) return
         val files = (param.args[3] as? List<Attachment<*>>).orEmpty()
         if (files.isEmpty()) return
+        // The chat input has no channel id of its own; the send goes to the selected channel (same source as Aliucord's CommandsAPI)
+        val channelId = StoreStream.getChannelsSelected().id
+        if (!E2ee.encryptOn(channelId)) return
         val message = param.args[2] as MessageContent
         try {
-            val out = Media.encryptForSend(context, key, files, message.textContent.trim())
+            val out = Media.encryptForSend(context, channelId, files, message.textContent.trim())
+            if (out == null) {
+                param.result = null // the user was already told why
+                return
+            }
             param.args[3] = out.attachments
             param.args[2] = MessageContent(out.content, message.mentionedUsers)
         } catch (e: Throwable) {
@@ -201,20 +199,18 @@ class E2eePlugin : Plugin() {
             val label = if (kind == Media.Kind.VIDEO) "View decrypted video" else "View decrypted image"
             val entry = Media.menuEntry(ctx, label) {
                 sheet.dismiss()
-                Media.showDecrypted(ctx, target.url, kind) { logger.error("Media decrypt failed", it) }
+                Media.showDecrypted(ctx, target.url, kind, model.message) { logger.error("Media decrypt failed", it) }
             }
             layout.addView(entry, layout.indexOfChild(anchor))
         }
 
-        // Inline view: show encrypted images where the generic file card would be
-        patcher.after<WidgetChatListAdapterItemAttachment>(
-            "configureFileData",
-            MessageAttachment::class.java,
-            MessageRenderContext::class.java,
-        ) { param ->
+        // Inline view: show encrypted images where the generic file card would be. Hooked on onConfigure like the
+        // AudioPlayer plugin, because the attachment entry also carries the message (channel and author ids).
+        patcher.after<WidgetChatListAdapterItemAttachment>("onConfigure", Int::class.java, ChatListEntry::class.java) { param ->
             try {
+                val entry = param.args[1] as? AttachmentEntry ?: return@after
                 val root = WidgetChatListAdapterItemAttachment.`access$getBinding$p`(this).root as ConstraintLayout
-                Inline.bind(root, param.args[0] as MessageAttachment, settings.getBool(E2ee.INLINE, true))
+                Inline.bind(root, entry.attachment, entry.message, settings.getBool(E2ee.INLINE, true))
             } catch (e: Throwable) {
                 logger.error("Inline media failed", e)
             }

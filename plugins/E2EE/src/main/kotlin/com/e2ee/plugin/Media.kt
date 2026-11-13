@@ -23,34 +23,20 @@ import com.discord.utilities.attachments.AttachmentUtilsKt
 import com.discord.utilities.color.ColorCompat
 import com.lytefast.flexinput.R
 import com.lytefast.flexinput.model.Attachment
-import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileInputStream
 import java.io.IOException
-import java.io.InputStream
-import java.net.HttpURLConnection
-import java.net.URL
-import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.ThreadPoolExecutor
-import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
-import javax.crypto.Cipher
 import javax.crypto.SecretKey
-import javax.crypto.spec.GCMParameterSpec
+import com.discord.models.message.Message as ModelMessage
 
 /**
- * Encrypted file support. The file is `IV(12) || AES-GCM`, the name carries a ".enc" marker
- * before the extension and the caption starts with a "[sz:W,H]" tag.
+ * Glue between Discord and the vendored Aegires MediaCache. Files are named "<random>.enc.<ext>" (the Aegires
+ * rule) and the caption starts with a "[sz:W,H]" tag. Fetching, caching and decrypting is done by MediaCache.
  */
 object Media {
-    private const val MAX_IMAGE_BYTES = 50 * 1024 * 1024
-    private const val MAX_SIDE = 1600
     private const val CACHE_TTL_MS = 60 * 60 * 1000L
-    private const val DISK_CACHE_BYTES = 150L * 1024 * 1024
 
     @Volatile private var appContext: Context? = null
 
@@ -59,8 +45,10 @@ object Media {
     }
 
     private val ENC_MARKER = Pattern.compile("\\.enc(?=\\.|$)", Pattern.CASE_INSENSITIVE)
-    private val IMAGE_NAME = Pattern.compile("\\.(?:png|jpe?g|gif|webp|bmp)$", Pattern.CASE_INSENSITIVE)
     private val VIDEO_NAME = Pattern.compile("\\.(?:mp4|mov|webm|m4v|3gp)$", Pattern.CASE_INSENSITIVE)
+
+    // Same pattern as Aegires MessageCryptoHelper
+    private val SIZE_TAG = Pattern.compile("^\\[sz:(\\d+),(\\d+)\\]")
 
     val menuViewId = View.generateViewId()
 
@@ -68,77 +56,45 @@ object Media {
 
     class Outgoing(val attachments: List<Attachment<*>>, val content: String)
 
-    /** A decoded (possibly downscaled) image plus the size of the original. */
-    class Loaded(val bitmap: Bitmap, val width: Int, val height: Int)
+    // Message id -> size from the tag, so the placeholder has the right ratio before the image arrives
+    private val dims = LruCache<Long, IntArray>(500)
 
-    // Decoded images, bounded by a fraction of the app heap. Memory only, nothing decrypted touches disk.
-    private val cache = object : LruCache<String, Loaded>(
-        Math.max(4 * 1024 * 1024, (Runtime.getRuntime().maxMemory() / 16).toInt()),
-    ) {
-        override fun sizeOf(key: String, value: Loaded): Int = value.bitmap.byteCount
-    }
     // Files currently being decrypted for viewing, so repeated taps do not open the viewer several times
     private val opening: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
-    private val failed: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
-    private val waiting = HashMap<String, MutableList<(Loaded?) -> Unit>>()
-
-    // Two workers at most, idle threads time out so nothing is held while the chat is quiet.
-    private val pool = ThreadPoolExecutor(2, 2, 30L, TimeUnit.SECONDS, LinkedBlockingQueue<Runnable>())
-        .apply { allowCoreThreadTimeOut(true) }
 
     fun baseUrl(url: String): String {
         val query = url.indexOf('?')
         return if (query > 0) url.substring(0, query) else url
     }
 
-    fun cached(base: String): Loaded? = cache.get(base)
+    fun dimensions(messageId: Long): IntArray? = dims.get(messageId)
 
-    fun hasFailed(base: String): Boolean = failed.contains(base)
+    // Aegires MessageCryptoHelper.extractAndCleanDimensions: remember the size, drop the tag from the text
+    fun stripSizeTag(text: String, messageId: Long? = null): String {
+        val m = SIZE_TAG.matcher(text)
+        if (!m.find()) return text
+        val w = m.group(1)?.toIntOrNull()
+        val h = m.group(2)?.toIntOrNull()
+        if (messageId != null && w != null && h != null) dims.put(messageId, intArrayOf(w, h))
+        return text.substring(m.end())
+    }
 
-    /** Call whenever the key changes, so images are decrypted again with the new key. */
+    fun spec(url: String, kind: Kind, key: SecretKey, channelId: Long, senderId: String?, w: Int, h: Int): MediaCache.Spec {
+        val channel = channelId.toString()
+        return if (kind == Kind.VIDEO) MediaCache.Spec.encryptedVideo(url, key, channel, senderId, -1L, w)
+        else MediaCache.Spec.encryptedImage(url, key, channel, senderId, -1L, w, h)
+    }
+
+    /** Call whenever the key changes: MediaCache drops decrypted images, failures and plaintext temp files. */
     fun onKeyChanged() {
-        cache.evictAll()
-        failed.clear()
+        val ctx = appContext ?: return
+        MediaCache.get(ctx).clearSensitive()
     }
 
-    /** Downloads and decrypts an image off the main thread. [done] runs on the main thread. */
-    fun loadInline(url: String, base: String, done: (Loaded?) -> Unit) {
-        val key = E2ee.key
-        if (key == null) {
-            done(null)
-            return
-        }
-        synchronized(waiting) {
-            val list = waiting[base]
-            if (list != null) {
-                list.add(done)
-                return
-            }
-            waiting[base] = arrayListOf(done)
-        }
-        val queuedAt = System.nanoTime()
-        pool.execute {
-            val startedAt = System.nanoTime()
-            val result = try {
-                downloadImage(url, base, key)
-            } catch (e: Throwable) {
-                E2ee.onError(e)
-                null
-            }
-            E2ee.log("inline wait=${ms(queuedAt, startedAt)}ms total=${ms(startedAt, System.nanoTime())}ms ok=${result != null}")
-            if (result != null) cache.put(base, result) else failed.add(base)
-            val callbacks = synchronized(waiting) { waiting.remove(base) }
-            Utils.mainThread.post { callbacks?.forEach { it(result) } }
-        }
-    }
-
+    // Same rule as Aegires AttachmentViewFactory: the marker decides, videos by extension, everything else is an image
     fun encryptedKind(filename: String?): Kind? {
         if (filename == null || !ENC_MARKER.matcher(filename).find()) return null
-        return when {
-            IMAGE_NAME.matcher(filename).find() -> Kind.IMAGE
-            VIDEO_NAME.matcher(filename).find() -> Kind.VIDEO
-            else -> null
-        }
+        return if (VIDEO_NAME.matcher(filename).find()) Kind.VIDEO else Kind.IMAGE
     }
 
     // "photo.png" becomes "photo.enc.png"
@@ -188,10 +144,14 @@ object Media {
         return dir
     }
 
-    /** Encrypts every file and the caption. Throws on any failure so the caller can cancel the send. */
-    fun encryptForSend(app: Context, key: SecretKey, originals: List<Attachment<*>>, caption: String): Outgoing {
-        val plain = sizeTag(app, originals[0].uri) + caption
-        if (plain.length > Crypto.MAX_PLAINTEXT_LEN) throw IOException("Caption too long")
+    /** Null means nothing is sent and the user was told why. Throws on I/O errors so the caller can cancel the send. */
+    fun encryptForSend(app: Context, channelId: Long, originals: List<Attachment<*>>, caption: String): Outgoing? {
+        // Caption first: same checks and toasts as text messages, before any file is processed
+        val content = E2ee.encryptText(channelId, sizeTag(app, originals[0].uri) + caption) ?: return null
+        val key = E2ee.keyFor(channelId) ?: return null
+        val sender = E2ee.selfId() ?: return null
+        val preset = E2ee.presetFor(channelId)
+        val channel = channelId.toString()
 
         val dir = cacheDir(app)
         val created = ArrayList<File>()
@@ -204,18 +164,18 @@ object Media {
                     ?: throw IOException("Cannot read attachment")
                 input.use { src ->
                     file.outputStream().use { dst ->
-                        if (!Crypto.encryptStream(src, dst, key)) throw IOException("Encryption failed")
+                        if (!Crypto.encryptStream(src, dst, key, preset, channel, sender)) throw IOException("Encryption failed")
                     }
                 }
+                val name = encryptedName(FileNames.randomFor(original.displayName, app.contentResolver.getType(original.uri)))
                 val local = LocalAttachment(
                     SnowflakeUtils.fromTimestamp(System.currentTimeMillis()),
                     Uri.fromFile(file).toString(),
-                    encryptedName(original.displayName),
+                    name,
                 )
                 result.add(AttachmentUtilsKt.toAttachment(local))
             }
-            val encrypted = Crypto.encrypt(plain, key) ?: throw IOException("Caption encryption failed")
-            return Outgoing(result, encrypted)
+            return Outgoing(result, content)
         } catch (e: Throwable) {
             created.forEach { it.delete() }
             throw e
@@ -234,160 +194,50 @@ object Media {
             }
         }
 
-    fun showDecrypted(ctx: Context, url: String, kind: Kind, onError: (Throwable) -> Unit) {
-        val key = E2ee.key
+    fun showDecrypted(ctx: Context, url: String, kind: Kind, message: ModelMessage, onError: (Throwable) -> Unit) {
+        val channelId = message.channelId
+        val key = E2ee.keyFor(channelId)
         if (key == null) {
-            Utils.showToast("Set the password in plugin settings first.")
+            Utils.showToast(if (E2ee.isForced(channelId)) "Encryption key not ready yet" else "Set the password in plugin settings first.")
             return
         }
         val base = baseUrl(url)
         if (!opening.add(base)) return
         Utils.showToast("Decrypting...")
-        Utils.threadPool.execute {
-            var bitmap: Bitmap? = null
-            var video: File? = null
-            try {
-                if (kind == Kind.IMAGE) bitmap = downloadImage(url, base, key)?.bitmap else video = downloadVideo(ctx, url, key)
-            } catch (e: Throwable) {
-                onError(e)
-            }
-            val image = bitmap
-            val file = video
-            Utils.mainThread.post {
-                opening.remove(base)
-                when {
-                    image != null -> showBitmap(ctx, image)
-                    file != null -> playVideo(ctx, file)
-                    else -> Utils.showToast("Could not decrypt this file.")
+        val metrics = ctx.resources.displayMetrics
+        val spec = spec(url, kind, key, channelId, message.author?.id?.toString(), metrics.widthPixels, metrics.heightPixels)
+        spec.force = true
+        val cache = MediaCache.get(ctx.applicationContext)
+        if (kind == Kind.IMAGE) {
+            cache.loadBitmap(spec, object : MediaCache.SimpleCallback() {
+                override fun onBitmap(bitmap: Bitmap, sourceWidth: Int, sourceHeight: Int) {
+                    opening.remove(base)
+                    showBitmap(ctx, bitmap)
                 }
-            }
-        }
-    }
 
-    private fun open(url: String): HttpURLConnection? {
-        if (!url.startsWith("https://")) return null
-        val conn = URL(url).openConnection() as HttpURLConnection
-        conn.connectTimeout = 8000
-        conn.readTimeout = 30000
-        return conn
-    }
+                override fun onFailure(failure: MediaCache.Failure) {
+                    opening.remove(base)
+                    Utils.showToast("Could not decrypt this file.")
+                    onError(IOException("Image decrypt failed: ${failure.kind}"))
+                }
+            })
+        } else {
+            cache.decryptToTemp(spec, object : MediaCache.TempCallback {
+                override fun onProgress(done: Long, total: Long) {}
 
-    private fun ms(from: Long, to: Long): Long = (to - from) / 1_000_000
+                override fun onNeedsConfirm(bytes: Long) {}
 
-    private class Fetched(val bytes: ByteArray, val fromDisk: Boolean)
+                override fun onFile(plaintext: File) {
+                    opening.remove(base)
+                    playVideo(ctx, plaintext)
+                }
 
-    private fun readAll(input: InputStream, limit: Int): ByteArray? {
-        val out = ByteArrayOutputStream()
-        val buf = ByteArray(64 * 1024)
-        while (true) {
-            val n = input.read(buf)
-            if (n < 0) break
-            out.write(buf, 0, n)
-            if (out.size() > limit) return null
-        }
-        return out.toByteArray()
-    }
-
-    // The disk cache holds the downloaded ciphertext only, so nothing readable is stored on disk
-    private fun diskFile(base: String): File? {
-        val app = appContext ?: return null
-        val dir = File(app.cacheDir, "e2ee-images").apply { mkdirs() }
-        val hash = MessageDigest.getInstance("SHA-256").digest(base.toByteArray(StandardCharsets.UTF_8))
-        val name = StringBuilder()
-        for (b in hash) name.append(String.format("%02x", b))
-        return File(dir, name.toString())
-    }
-
-    private fun saveAndPrune(file: File, bytes: ByteArray) {
-        try {
-            val tmp = File(file.parentFile, file.name + ".tmp")
-            tmp.outputStream().use { it.write(bytes) }
-            if (!tmp.renameTo(file)) tmp.delete()
-        } catch (ignored: Exception) {
-        }
-        val files = file.parentFile?.listFiles() ?: return
-        var total = 0L
-        for (f in files) total += f.length()
-        if (total <= DISK_CACHE_BYTES) return
-        java.util.Arrays.sort(files) { a, b -> java.lang.Long.compare(a.lastModified(), b.lastModified()) }
-        for (f in files) {
-            if (total <= DISK_CACHE_BYTES) break
-            val size = f.length()
-            if (f.delete()) total -= size
-        }
-    }
-
-    private fun fetchCiphertext(url: String, base: String): Fetched? {
-        val file = diskFile(base)
-        if (file != null && file.exists() && file.length() > 0) {
-            val cached = FileInputStream(file).use { readAll(it, MAX_IMAGE_BYTES + 28) }
-            if (cached != null) {
-                file.setLastModified(System.currentTimeMillis())
-                return Fetched(cached, true)
-            }
-        }
-        val conn = open(url) ?: return null
-        try {
-            if (conn.responseCode != 200) return null
-            val bytes = conn.inputStream.use { readAll(it, MAX_IMAGE_BYTES + 28) } ?: return null
-            if (file != null) saveAndPrune(file, bytes)
-            return Fetched(bytes, false)
-        } finally {
-            conn.disconnect()
-        }
-    }
-
-    // Same bytes as Crypto.decryptBytes (IV(12) || AES-GCM), but one doFinal call instead of a chunked CipherInputStream
-    private fun decryptImage(raw: ByteArray, key: SecretKey): ByteArray? {
-        if (raw.size >= 28) {
-            try {
-                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-                cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, raw, 0, 12))
-                return cipher.doFinal(raw, 12, raw.size - 12)
-            } catch (ignored: Exception) {
-            }
-        }
-        return Crypto.decryptBytes(raw, key)
-    }
-
-    private fun downloadImage(url: String, base: String, key: SecretKey): Loaded? {
-        val t0 = System.nanoTime()
-        val fetched = fetchCiphertext(url, base) ?: return null
-        val t1 = System.nanoTime()
-        val plain = decryptImage(fetched.bytes, key) ?: return null
-        val t2 = System.nanoTime()
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeByteArray(plain, 0, plain.size, bounds)
-        var sample = 1
-        while (bounds.outWidth / sample > MAX_SIDE || bounds.outHeight / sample > MAX_SIDE) sample *= 2
-        val options = BitmapFactory.Options().apply { inSampleSize = sample }
-        val bitmap = BitmapFactory.decodeByteArray(plain, 0, plain.size, options) ?: return null
-        E2ee.log(
-            "image ${fetched.bytes.size / 1024}KB ${bounds.outWidth}x${bounds.outHeight} sample=$sample " +
-                "src=${if (fetched.fromDisk) "disk" else "net"} fetch=${ms(t0, t1)}ms " +
-                "decrypt=${ms(t1, t2)}ms decode=${ms(t2, System.nanoTime())}ms",
-        )
-        return Loaded(bitmap, bounds.outWidth, bounds.outHeight)
-    }
-
-    private fun downloadVideo(ctx: Context, url: String, key: SecretKey): File? {
-        val base = baseUrl(url)
-        val file = File(cacheDir(ctx), Math.abs(base.hashCode()).toString() + ".mp4")
-        if (file.exists() && file.length() > 0) return file
-
-        val conn = open(url) ?: return null
-        try {
-            if (conn.responseCode != 200) return null
-            val ok = conn.inputStream.use { input ->
-                file.outputStream().use { out -> Crypto.decryptStream(input, out, key) }
-            }
-            if (!ok || file.length() == 0L) {
-                file.delete()
-                return null
-            }
-            return file
-        } finally {
-            conn.disconnect()
+                override fun onFailure(failure: MediaCache.Failure) {
+                    opening.remove(base)
+                    Utils.showToast("Could not decrypt this file.")
+                    onError(IOException("Video decrypt failed: ${failure.kind}"))
+                }
+            })
         }
     }
 
@@ -404,6 +254,7 @@ object Media {
         }
     }
 
+    // The plaintext temp file is deleted by MediaCache when the player closes, as in Aegires
     private fun playVideo(ctx: Context, file: File) {
         val video = VideoView(ctx)
         video.setMediaController(MediaController(ctx).apply { setAnchorView(video) })
@@ -416,7 +267,10 @@ object Media {
         }
         Dialog(ctx, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
             setContentView(frame)
-            setOnDismissListener { video.stopPlayback() }
+            setOnDismissListener {
+                video.stopPlayback()
+                MediaCache.deleteTemp(file)
+            }
             show()
         }
     }
