@@ -1,12 +1,12 @@
-version = "2.0.0" // Plugin version. Increment this to trigger an update
+version = "2.0.1" // Plugin version. Increment this to trigger an update
 description = "End-to-end encryption for messages" // Plugin description that will be shown to user
 
 aliucord {
     // Changelog of your plugin
     changelog.set(
         """
-        # 2.0.0
-        * Reworked for the new Aegires encryption
+        # 2.0.1
+        * Added encryption preset setting
         """.trimIndent(),
     )
     // Image or Gif that will be shown at the top of your changelog page
