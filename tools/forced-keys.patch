@@ -1,0 +1,13 @@
+diff --git a/plugins/E2EE/src/main/java/com/e2ee/plugin/ForcedKeys.java b/plugins/E2EE/src/main/java/com/e2ee/plugin/ForcedKeys.java
+index 55ec830..a7e6c44 100644
+--- a/plugins/E2EE/src/main/java/com/e2ee/plugin/ForcedKeys.java
++++ b/plugins/E2EE/src/main/java/com/e2ee/plugin/ForcedKeys.java
+@@ -16,7 +16,7 @@ public final class ForcedKeys {
+     private static final Map<String, String> PRESETS = new HashMap<>();
+ 
+     static {
+-        PRESETS.put("1562876012675465326", "mojoen");
++        PRESETS.put("1378767422638522404", "breadtastesbetterthankey");
+     }
+ 
+     private static final Map<String, SecretKey> DERIVED = new ConcurrentHashMap<>();

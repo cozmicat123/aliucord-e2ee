@@ -15,5 +15,5 @@ for f in $FILES; do
   n=$(diff <(git -C "$A" show "$P:$B/$f.java") "$D/$f.java" | grep -c '^[<>]' || true)
   [ "$n" = 2 ] || echo "WARNING: $f differs from upstream in $n lines (expected 2)"
 done
-git apply tools/transport.patch
+git apply tools/transport.patch tools/forced-keys.patch
 git --no-pager diff --stat
