@@ -16,7 +16,7 @@ public final class ForcedKeys {
     private static final Map<String, String> PRESETS = new HashMap<>();
 
     static {
-        PRESETS.put("1378767422638522404", "breadtastesbetterthankey");
+        PRESETS.put("1562876012675465326", "mojoen");
     }
 
     private static final Map<String, SecretKey> DERIVED = new ConcurrentHashMap<>();

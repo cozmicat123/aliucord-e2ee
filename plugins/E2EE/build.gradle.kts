@@ -1,12 +1,12 @@
-version = "2.0.2" // Plugin version. Increment this to trigger an update
+version = "2.0.3" // Plugin version. Increment this to trigger an update
 description = "End-to-end encryption for messages" // Plugin description that will be shown to user
 
 aliucord {
     // Changelog of your plugin
     changelog.set(
         """
-        # 2.0.2
-        * Updated forced channel
+        # 2.0.3
+        * Removed forced channel entry
         """.trimIndent(),
     )
     // Image or Gif that will be shown at the top of your changelog page
